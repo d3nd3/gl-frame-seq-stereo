@@ -69,7 +69,22 @@ This method is:
 - **More compatible**: Works with applications that don't follow strict `glClear()` patterns
 - **Robust**: Avoids the matrix multiplication order issues of late-stage primitive interposition
 
+### The Timing Challenge
+
+However, there's a fundamental challenge with this approach: **you want to set the camera transform early, but you still want to apply it at the end of the app's camera transform sequence**. The problem is that you can never reliably tell when the last `glTranslatef` or `glRotatef` camera transform call has occurred.
+
+This creates a delicate balancing act:
+- Apply the stereo transform too early, and it gets overridden by subsequent camera transforms
+- Apply it too late, and it affects object-specific transformations instead of just the camera
+- There's no clear signal in the OpenGL fixed pipeline to indicate "camera setup is complete"
+
+This timing uncertainty is one of the core challenges in implementing frame-sequential stereo for fixed pipeline OpenGL applications.
+
 In summary, the wrapper will track matrix mode changes to detect frame boundaries and apply stereo transformations at the appropriate time in the matrix setup sequence, ensuring correct stereoscopic effects.
+
+## Current BUGS
+- `gamemoderun` is causing jitter, not sure why yet
+- It claims `glClear` is ran 8 times, not sure why!
 
 ## Alternative Approach: Applying Matrix Transformation in `glClear`
 

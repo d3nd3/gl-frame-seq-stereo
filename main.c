@@ -15,8 +15,25 @@
 #include "nvstusb.h"
 #include <time.h>
 
-static float CONVERGENCE = 275.0f;
-static float EYE_OFFSET = 1.17f;
+#include <sys/time.h>
+
+#define TIMER_RES_NANO
+#ifdef TIMER_RES_NANO
+
+#define CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD1 1
+#define CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD2_CLEAR 1
+
+#else
+
+#define CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD1 1
+#define CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD2_CLEAR 1
+
+#endif
+static int cameraTimerSet = 0;
+static struct timespec cameraSetupStart;
+
+static float CONVERGENCE = -1370.0f;
+static float EYE_OFFSET = 0.81f;
 
 static Display *current_dpy = NULL;
 static GLXDrawable current_drawable = 0;
@@ -36,6 +53,7 @@ void (*real_glXSwapBuffers)(Display *dpy, GLXDrawable drawable) = NULL;
 GLXContext (*real_glXCreateContext)(Display *dpy, XVisualInfo *vis, GLXContext shareList, Bool direct) = NULL;
 __GLXextFuncPtr (*real_glXGetProcAddress)(const GLubyte*) = NULL;
 __GLXextFuncPtr (*real_glXGetProcAddressARB)(const GLubyte*) = NULL;
+void (*real_glXMakeCurrent)(Display *dpy, GLXDrawable drawable, GLXContext ctx) = NULL;
 
 typedef void (*fp_glXSwapBuffers)(Display* dpy, GLXDrawable drawable);
 typedef __GLXextFuncPtr (*fp_glXGetProcAddress) (const GLubyte* procName);
@@ -104,6 +122,7 @@ static void initialize_real_functions(void) {
     real_glRotatef = dlsym(RTLD_NEXT, "glRotatef");
     real_glXSwapBuffers = dlsym(RTLD_NEXT, "glXSwapBuffers");
     real_glXCreateContext = dlsym(RTLD_NEXT, "glXCreateContext");
+    real_glXMakeCurrent = dlsym(RTLD_NEXT, "glXMakeCurrent");
     real_glXGetProcAddress = (__GLXextFuncPtr (*)(const GLubyte*))dlsym(RTLD_NEXT, "glXGetProcAddress");
     real_glXGetProcAddressARB = (__GLXextFuncPtr (*)(const GLubyte*))dlsym(RTLD_NEXT, "glXGetProcAddressARB");
     
@@ -120,6 +139,7 @@ static void initialize_real_functions(void) {
     if (!real_glRotatef) fprintf(stderr, "[stereo] Failed to find real glRotatef!\n");
     if (!real_glXSwapBuffers) fprintf(stderr, "[stereo] Failed to find real glXSwapBuffers!\n");
     if (!real_glXCreateContext) fprintf(stderr, "[stereo] Failed to find real glXCreateContext!\n");
+    if (!real_glXMakeCurrent) fprintf(stderr, "[stereo] Failed to find real glXMakeCurrent!\n");
     if (!real_glXGetProcAddress) fprintf(stderr, "[stereo] Failed to find real glXGetProcAddress!\n");
     if (!real_glXGetProcAddressARB) fprintf(stderr, "[stereo] Failed to find real glXGetProcAddressARB!\n");
     
@@ -167,6 +187,10 @@ static __GLXextFuncPtr handle_glx_get_proc_address(const GLubyte* procName, __GL
     if (strcmp((const char*)procName, "glXCreateContext") == 0) {
         return (__GLXextFuncPtr)glXCreateContext; // Return our hooked version
     }
+    // If this is glXMakeCurrent, return our hooked version instead
+    if (strcmp((const char*)procName, "glXMakeCurrent") == 0) {
+        return (__GLXextFuncPtr)glXMakeCurrent; // Return our hooked version
+    }
     
     // Return the original function pointer for everything else
     return result;
@@ -207,7 +231,6 @@ void gluPerspective(GLdouble fovy, GLdouble aspect, GLdouble zNear, GLdouble zFa
 void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top,
     GLdouble zNear, GLdouble zFar) {
   
-
     // Debug
     fprintf(stderr, "[stereo] glFrustum(l=%.3f, r=%.3f, b=%.3f, t=%.3f, n=%.3f, f=%.3f)\n",
             left, right, bottom, top, zNear, zFar);
@@ -231,20 +254,19 @@ static void apply_eye_transform(void) {
     if (camera_transform_disabled) {
         return; // Skip stereo transformation
     }
-    printf("Applied apply_eye_transform()\n");
 
+    #if 0    
     GLint matrix_mode;
     glGetIntegerv(GL_MATRIX_MODE, &matrix_mode);
-    
     real_glMatrixMode(GL_MODELVIEW);
-
     // Save the current modelview matrix
     glGetFloatv(GL_MODELVIEW_MATRIX, savedModelViewMatrix);
     hasSavedMatrix = 1;
-    
+    #endif
+
     // Apply proper stereo transformation
     float eye_offset = (current_camera == CAMERA_LEFT) ? -EYE_OFFSET : EYE_OFFSET;
-    
+    //real_glLoadIdentity();
     // Step 1: Translate to eye position
     glTranslatef(eye_offset, 0.0f, 0.0f);
     
@@ -256,23 +278,34 @@ static void apply_eye_transform(void) {
     // Rotate around Y-axis to point cameras inward
     glRotatef(-convergence_angle_deg, 0.0f, 1.0f, 0.0f);
     
-    glMatrixMode(matrix_mode);
+    //glMatrixMode(matrix_mode);
     
     appliedEyeTransformThisFrame = 1;
     
 }
 
+int clearCount = 0;
 // Interposed glClear - apply proper stereo view transformation
 void glClear(GLbitfield mask) {
-
+    clearCount += 1;
     //This line is important atm, causes black window if not here.
     //If we call glClear(), apply on-top of the glMatrixMode(GL_MODELVIEW), glLoadIdentity() mechanism.
     //appliedEyeTransformThisFrame = 0;
 
     // Apply stereo view transformation at the start of each frame
-    if (mask & GL_COLOR_BUFFER_BIT) {
-        printf("Attempting to apply_eye_transform from glClear()\n");
-        apply_eye_transform();
+    if ((mask & GL_COLOR_BUFFER_BIT) && !cameraTimerSet && !appliedEyeTransformThisFrame){
+
+        #ifdef TIMER_RES_NANO
+        if (clock_gettime(CLOCK_MONOTONIC, &cameraSetupStart) == -1) {
+            perror("clock_gettime (start)");
+        }
+        #else
+        gettimeofday(&cameraSetupStart, NULL);
+        
+        #endif
+        cameraTimerSet = 2;
+        //printf("Attempting to apply_eye_transform from glClear()\n");
+        //apply_eye_transform();
     }
     
     real_glClear(mask);
@@ -290,17 +323,29 @@ void glMatrixMode(GLenum mode) {
     real_glMatrixMode(mode);
 }
 
+
+
+
 // Interposed glLoadIdentity - apply eye transform if conditions are met
 void glLoadIdentity(void) {
 
     real_glLoadIdentity();
 
     // Apply eye transform if afterGLmatrixMode is true
-    if (afterGLmatrixMode) {
+    if (afterGLmatrixMode && !cameraTimerSet && !appliedEyeTransformThisFrame) {
         afterGLmatrixMode = 0;
 
-        printf("Attempting to apply_eye_transform from glLoadIdetntity()\n");
-        apply_eye_transform();
+        #ifdef TIMER_RES_NANO
+        if (clock_gettime(CLOCK_MONOTONIC, &cameraSetupStart) == -1) {
+            perror("clock_gettime (start)");
+        }
+        #else
+        gettimeofday(&cameraSetupStart, NULL);
+        #endif
+        cameraTimerSet = 1;
+
+        //printf("Attempting to apply_eye_transform from glLoadIdetntity()\n");
+        //apply_eye_transform();
         
     }
 }
@@ -316,17 +361,21 @@ static int glxswapbuffers_initialized = 0;
 
 // Interposed glXSwapBuffers
 void glXSwapBuffers(Display *dpy, GLXDrawable drawable) {
+    //How is glClear called 8 times?
+    printf("clear was called %i times\n");
+    clearCount = 0;
+
     current_dpy = dpy;
     current_drawable = drawable;
     
    
-    
     // Perform initialization on first call
     if (!glxswapbuffers_initialized) {
         glxswapbuffers_initialized = 1;
         init_emitter();
     }
 
+    #if 1
     // Handle stereo frame sequencing
     if (current_camera == CAMERA_LEFT) {
         nvstusb_swap(nv_ctx, nvstusb_left, glx_swap_callback);
@@ -335,7 +384,11 @@ void glXSwapBuffers(Display *dpy, GLXDrawable drawable) {
         nvstusb_swap(nv_ctx, nvstusb_right, glx_swap_callback);
         current_camera = CAMERA_LEFT;
     }
+    #else
+    real_glXSwapBuffers(dpy,drawable);
+    #endif
 
+    /*
     // Restore the saved modelview matrix
     if (hasSavedMatrix) {
         GLint matrix_mode;
@@ -345,14 +398,16 @@ void glXSwapBuffers(Display *dpy, GLXDrawable drawable) {
         real_glMatrixMode(matrix_mode);
         hasSavedMatrix = 0;
     }
-
+    */
     afterSwapBuffers = 1;
     appliedEyeTransformThisFrame = 0;
     afterGLmatrixMode = 0;
 
+    /*
     poll_stereo_hotkeys();
     // Handle user input from the 3D controller
     handle_user_input();
+    */
 }
 
 // Matrix stack tracking - keep your existing implementation
@@ -363,9 +418,47 @@ int is_matrix_stack_empty(void) {
 }
 
 void glPushMatrix(void) {
-   
     matrix_stack_depth++;
     real_glPushMatrix();
+
+    if ( cameraTimerSet ) {
+        #ifdef TIMER_RES_NANO
+        struct timespec now;
+        long long elapsed_ns; 
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+            perror("clock_gettime (end)");
+        }
+
+        elapsed_ns = (long long)(now.tv_sec - cameraSetupStart.tv_sec) * 1000000000LL +
+                     (now.tv_nsec - cameraSetupStart.tv_nsec);
+
+        long long usec = cameraTimerSet == 2 ? CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD2_CLEAR : CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD1;
+        if (elapsed_ns > usec) {
+            cameraTimerSet = 0;
+
+            //printf("Attempting to apply_eye_transform from (timer) glPushMatrix()\n");
+            apply_eye_transform();
+        }
+        #else
+        struct timeval now;
+
+        gettimeofday(&now, NULL);
+
+        long elapsed = (now.tv_sec - cameraSetupStart.tv_sec) * 1000000L +
+                       (now.tv_usec - cameraSetupStart.tv_usec);
+
+
+        int usec = cameraTimerSet == 2 ? CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD2_CLEAR : CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD1;
+        if (elapsed > usec) {
+            cameraTimerSet = 0;
+
+            //printf("Attempting to apply_eye_transform from (timer) glPushMatrix()\n");
+            apply_eye_transform();
+        }
+        #endif
+    }
+    
 }
 
 void glPopMatrix(void) {
@@ -381,7 +474,7 @@ void glPopMatrix(void) {
 // Interposed glTranslatef - can be used for debugging or additional transformations
 void glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
     // Debug output
-    fprintf(stderr, "[stereo] glTranslatef(x=%.3f, y=%.3f, z=%.3f)\n", x, y, z);
+    //fprintf(stderr, "[stereo] glTranslatef(x=%.3f, y=%.3f, z=%.3f)\n", x, y, z);
     
     // Call the real function
     real_glTranslatef(x, y, z);
@@ -390,7 +483,7 @@ void glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
 // Interposed glRotatef - can be used for debugging or additional transformations
 void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z) {
     // Debug output
-    fprintf(stderr, "[stereo] glRotatef(angle=%.3f, x=%.3f, y=%.3f, z=%.3f)\n", angle, x, y, z);
+    //fprintf(stderr, "[stereo] glRotatef(angle=%.3f, x=%.3f, y=%.3f, z=%.3f)\n", angle, x, y, z);
     
     // Call the real function
     real_glRotatef(angle, x, y, z);
@@ -406,6 +499,17 @@ GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis, GLXContext shareList
     }
     
     return real_glXCreateContext(dpy, vis, shareList, direct);
+}
+
+// Interposed glXMakeCurrent - calls the real function
+Bool glXMakeCurrent(Display *dpy, GLXDrawable drawable, GLXContext ctx) {
+    initialize_real_functions();
+    if (!real_glXMakeCurrent) {
+        fprintf(stderr, "[stereo] Failed to find real glXMakeCurrent!\n");
+        return 0;
+    }
+    printf("CHATGPT GLXMAKECURRENT IDEA ==EEK==\n");
+    return ((Bool (*)(Display *, GLXDrawable, GLXContext))real_glXMakeCurrent)(dpy, drawable, ctx);
 }
 
 static void poll_stereo_hotkeys() {

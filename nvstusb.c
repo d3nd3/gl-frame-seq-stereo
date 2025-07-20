@@ -29,6 +29,126 @@
 
 #include <X11/Xlib.h>
 #include <X11/extensions/xf86vmode.h>
+
+// --- Globals for the Asynchronous I/O Thread ---
+
+// The thread itself
+static pthread_t io_thread;
+
+// Mutex and Condition Variable to manage the command queue
+static pthread_mutex_t io_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t io_cond = PTHREAD_COND_INITIALIZER;
+
+// The command queue. It's very simple: it just holds the next eye to set.
+// A value of 0 means "no command pending".
+// A value of 1 means "set left eye".
+// A value of 2 means "set right eye".
+// A value of -1 means "shut down the thread".
+static volatile int eye_command = 0;
+
+// We need a pointer to the nvstusb context for the I/O thread
+static struct nvstusb_context *async_nv_ctx = NULL;
+
+// Flag to track if the I/O thread is initialized
+static int io_thread_initialized = 0;
+
+// Forward declaration for nvstusb_set_eye
+static void nvstusb_set_eye(struct nvstusb_context *ctx, enum nvstusb_eye eye);
+
+// The consumer thread's main loop
+static void* io_thread_func(void* arg) {
+    (void)arg; // Unused
+
+    fprintf(stderr, "[stereo-io] I/O thread started.\n");
+
+    while (1) {
+        // Lock the mutex to safely access the shared eye_command variable
+        pthread_mutex_lock(&io_mutex);
+
+        // Wait until there is a command.
+        // pthread_cond_wait atomically unlocks the mutex and waits.
+        // When woken up, it re-locks the mutex before continuing.
+        while (eye_command == 0) {
+            pthread_cond_wait(&io_cond, &io_mutex);
+        }
+
+        // We have a command. Capture it and reset the queue.
+        int cmd = eye_command;
+        eye_command = 0;
+
+        // Unlock the mutex so the main thread isn't blocked while we do I/O
+        pthread_mutex_unlock(&io_mutex);
+
+        // --- Execute the command ---
+        if (cmd == -1) {
+            // Shutdown command
+            break; 
+        } else if (cmd == 1) { // Left eye
+            // This is the original blocking call, but now it's in a safe thread
+            nvstusb_set_eye(async_nv_ctx, nvstusb_left);
+        } else if (cmd == 2) { // Right eye
+            nvstusb_set_eye(async_nv_ctx, nvstusb_right);
+        }
+    }
+
+    fprintf(stderr, "[stereo-io] I/O thread shutting down.\n");
+    return NULL;
+}
+
+// The new non-blocking function to be called by the main thread
+static void nvstusb_set_eye_async(enum nvstusb_eye eye) {
+    // Lock the mutex to safely modify the command variable
+    pthread_mutex_lock(&io_mutex);
+
+    // Set the command for the I/O thread.
+    // We overwrite any previous command that hasn't been processed yet.
+    // This is fine because we only care about the most recent eye state.
+    if (eye == nvstusb_left) {
+        eye_command = 1;
+    } else if (eye == nvstusb_right) {
+        eye_command = 2;
+    }
+
+    // Signal the I/O thread that a new command is ready.
+    // This will wake it up from pthread_cond_wait.
+    pthread_cond_signal(&io_cond);
+
+    // Unlock the mutex. This entire function is extremely fast.
+    pthread_mutex_unlock(&io_mutex);
+}
+
+// Initialize the I/O thread
+static void init_io_thread(struct nvstusb_context *ctx) {
+    if (io_thread_initialized) return;
+    
+    async_nv_ctx = ctx;
+    if (pthread_create(&io_thread, NULL, io_thread_func, NULL) != 0) {
+        fprintf(stderr, "[stereo-io] Failed to create I/O thread!\n");
+        return;
+    }
+    
+    io_thread_initialized = 1;
+    fprintf(stderr, "[stereo-io] I/O thread initialized.\n");
+}
+
+// Shutdown the I/O thread
+static void shutdown_io_thread(void) {
+    if (!io_thread_initialized) return;
+    
+    fprintf(stderr, "[stereo-io] Requesting I/O thread shutdown...\n");
+    
+    // Send the shutdown command
+    pthread_mutex_lock(&io_mutex);
+    eye_command = -1; // -1 is the shutdown signal
+    pthread_cond_signal(&io_cond);
+    pthread_mutex_unlock(&io_mutex);
+
+    // Wait for the thread to finish
+    pthread_join(io_thread, NULL);
+    
+    io_thread_initialized = 0;
+    fprintf(stderr, "[stereo-io] Shutdown complete.\n");
+}
  
  static PFNGLXGETVIDEOSYNCSGIPROC glXGetVideoSyncSGI = NULL;
  static PFNGLXWAITVIDEOSYNCSGIPROC glXWaitVideoSyncSGI = NULL;
@@ -188,6 +308,9 @@ out_err:
    if(ctx->b_thread_running) {
      nvstusb_stop_stereo_thread(ctx);
    }
+ 
+   /* Shutdown I/O thread if running */
+   shutdown_io_thread();
  
    /* close device */
    if (0 != ctx->device) nvstusb_usb_close_device(ctx->device);
@@ -433,13 +556,16 @@ out_err:
      {
        /* case __GL_SYNC_TO_VBLANK is defined */
  
+       /* Initialize I/O thread if not already done */
+       init_io_thread(ctx);
+ 
        /* Swap buffers */
        if(swapfunc) {
          swapfunc();
        }
  
-       /* Change eye */
-       nvstusb_set_eye(ctx, eye);
+       /* Change eye - use async version to avoid blocking */
+       nvstusb_set_eye_async(eye);
      }
      break;
    case 3:
@@ -680,4 +806,10 @@ void nvstusb_set_refresh_rate(struct nvstusb_context *ctx) {
         fprintf(stderr, "[stereopreload] Could not get video mode line; refresh rate not set.\n");
     }
     XCloseDisplay(display);
+}
+
+// This function will be called automatically when your library is unloaded
+__attribute__((destructor))
+static void shutdown_io_thread_destructor(void) {
+    shutdown_io_thread();
 }
