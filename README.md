@@ -1,3 +1,17 @@
+Based on earlier libnvstusb code base. credits due.
+============
+Disclaimer
+==========
+
+This is an experimental proof of concept to get the NVIDIA 3d stereo
+controller working with OpenGL on linux. If this program or any part
+of it causes any damage to your hardware, software or health, it is your
+own fault. You have been warned.
+
+I do not claim any copyright or ownership on the firmware or drivers of
+any device by NVIDIA.
+
+
 # LD_PRELOAD OpenGL Frame-Sequential Stereo Wrapper
 
 ## Project Overview
@@ -46,44 +60,9 @@ While hooking `glBegin` might seem like a straightforward approach, it has signi
 - **Order matters in matrix multiplication**: Applying the stereo transform this late in the scene means it's applied last, which can lead to incorrect results since matrix multiplication is not commutative.
 - **Transform timing is critical**: The stereo camera transform must be applied early in the frame, before any object-specific transformations, to ensure proper eye separation and convergence.
 
-### Better Approach: Matrix Mode Detection
-
-A more robust approach is to detect when the application is setting up its matrices at the start of each frame. This can be achieved by:
-
-1. **Tracking `glMatrixMode(GL_MODELVIEW)` after `glSwapBuffers()`**: Set a boolean flag when the first call to `glMatrixMode(GL_MODELVIEW)` occurs after a buffer swap, indicating the start of a new frame's matrix setup.
-
-2. **Applying stereo transform in `glLoadIdentity()`**: Once the flag is set, intercept `glLoadIdentity()` calls and apply the eye-specific `glTranslate` transformation immediately after the identity matrix is loaded.
-
-3. **Alternative: Using `glClear()`**: While `glClear()` is commonly called at frame start, not all programs use it consistently, making matrix mode detection more reliable.
-
-This approach ensures that:
-- The stereo transform is applied early in the frame setup
-- The transform order is correct (stereo transform applied before object transforms)
-- It works with applications that may not use `glClear()` at frame boundaries
-
-### Why This Method is Superior
-
-This method is:
-- **Correctly ordered**: The stereo transform is applied before any object-specific transformations
-- **Frame-aware**: It properly detects frame boundaries through matrix mode changes
-- **More compatible**: Works with applications that don't follow strict `glClear()` patterns
-- **Robust**: Avoids the matrix multiplication order issues of late-stage primitive interposition
-
-### The Timing Challenge
-
-However, there's a fundamental challenge with this approach: **you want to set the camera transform early, but you still want to apply it at the end of the app's camera transform sequence**. The problem is that you can never reliably tell when the last `glTranslatef` or `glRotatef` camera transform call has occurred.
-
-This creates a delicate balancing act:
-- Apply the stereo transform too early, and it gets overridden by subsequent camera transforms
-- Apply it too late, and it affects object-specific transformations instead of just the camera
-- There's no clear signal in the OpenGL fixed pipeline to indicate "camera setup is complete"
-
-This timing uncertainty is one of the core challenges in implementing frame-sequential stereo for fixed pipeline OpenGL applications.
-
-In summary, the wrapper will track matrix mode changes to detect frame boundaries and apply stereo transformations at the appropriate time in the matrix setup sequence, ensuring correct stereoscopic effects.
-
 ## Current BUGS
 - `gamemoderun` is causing jitter, not sure why yet
+    - This is almost certainly due to `gamemoderun` disabling the compositor; the bug is noticeably worse with the compositor off at the moment.
 - It claims `glClear` is ran 8 times, not sure why!
 
 ## Alternative Approach: Applying Matrix Transformation in `glClear`
@@ -97,15 +76,7 @@ Another method for achieving frame-sequential stereoscopic 3D is to apply the ma
 ### Tradeoffs
 - **Assumptions**: This method assumes that the application resets or sets up its matrices at the start of each frame, which is true for many, but not all, fixed pipeline OpenGL apps.
 - **Potential Limitations**: If an application changes its matrices mid-frame or draws multiple scenes per frame, this approach may not always produce the intended effect.
-- **Inconsistent Usage**: Not all applications call `glClear()` consistently, making this method less reliable than matrix mode detection.
-
-### Comparison with Matrix Mode Detection
-
-While `glClear` interception is simpler than primitive interposition, the **matrix mode detection approach** (described above) is generally superior because:
-
-- **More Reliable**: Matrix mode detection works even when applications don't use `glClear()`
-- **Better Timing**: Ensures transforms are applied at the exact right moment in the matrix setup sequence
-- **Correct Order**: Guarantees stereo transforms are applied before object-specific transformations
+- **Inconsistent Usage**: Not all applications call `glClear()` consistently, making this method less reliable in some cases.
 
 ### Summary
-While `glClear` interception can work for some applications, the matrix mode detection approach provides a more robust and universally applicable solution for implementing stereoscopic effects in fixed pipeline OpenGL applications.
+While `glClear` interception can work for some applications, there are tradeoffs and limitations, but it remains a practical approach for many fixed pipeline OpenGL applications.

@@ -421,6 +421,13 @@ void glPushMatrix(void) {
     matrix_stack_depth++;
     real_glPushMatrix();
 
+    if (cameraTimerSet) {
+        cameraTimerSet = 0;
+        printf("glPushMatrix direct : want eye transform!\n");
+        apply_eye_transform();
+        return;
+    }
+
     if ( cameraTimerSet ) {
         #ifdef TIMER_RES_NANO
         struct timespec now;
@@ -436,8 +443,8 @@ void glPushMatrix(void) {
         long long usec = cameraTimerSet == 2 ? CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD2_CLEAR : CAMERA_TRANSFORM_TIMEOUT_USEC_METHOD1;
         if (elapsed_ns > usec) {
             cameraTimerSet = 0;
-
-            //printf("Attempting to apply_eye_transform from (timer) glPushMatrix()\n");
+            //elapsed = 10000-14326 nanoseconds, when request 1ns.
+            printf("[stereo] glPushMatrix timer elapsed_ns = %lld\n", elapsed_ns);
             apply_eye_transform();
         }
         #else
