@@ -10,12 +10,12 @@
  #include <stdio.h>
  #include <stdint.h>
  #include <stdlib.h>
- #include <errno.h>
  #include <string.h>
  #include <malloc.h>
  #include <time.h>
  #include <assert.h>
  #include <math.h>
+  #include <stdbool.h>
  #include <pthread.h>
  #include <unistd.h>
 
@@ -28,7 +28,10 @@
  #include "usb.h"
 
 #include <X11/Xlib.h>
-#include <X11/extensions/xf86vmode.h>
+ #include <X11/extensions/xf86vmode.h>
+ #ifdef USE_XRANDR
+ #include <X11/extensions/Xrandr.h>
+ #endif
 
 // --- Globals for the Asynchronous I/O Thread ---
 
@@ -154,6 +157,10 @@ static void shutdown_io_thread(void) {
  static PFNGLXWAITVIDEOSYNCSGIPROC glXWaitVideoSyncSGI = NULL;
  static PFNGLXSWAPINTERVALSGIPROC glXSwapIntervalSGI = NULL;
  static PFNGLXSWAPINTERVALEXTPROC glXSwapIntervalEXT = NULL;
+ static PFNGLXGETSYNCVALUESOMLPROC glXGetSyncValuesOML = NULL;
+ static PFNGLXWAITFORMSCOMLPROC glXWaitForMscOML = NULL;
+ static PFNGLXWAITFORSBCOMLPROC glXWaitForSbcOML = NULL;
+ static PFNGLXSWAPBUFFERSMSCOMLPROC glXSwapBuffersMscOML = NULL;
  
  /* Static functions */
  static void nvstusb_print_refresh_rate(void);
@@ -204,6 +211,14 @@ static void shutdown_io_thread(void) {
  
    /* Stereo thread state */
    char b_thread_running;
+
+    /* Prefer OML scheduled swaps when enabled */
+    int use_oml_schedule;
+
+    /* OML runtime health */
+    int oml_schedule_ok;
+    long long last_msc_seen;
+    int oml_stall_score;
  };
  
  /* initialize controller */
@@ -261,27 +276,34 @@ nvstusb_init(void)
   ctx->b_thread_running = 0;
 
 
+  /* Optional env override for vblank method */
+  const char *env_vblank = getenv("STEREO_VBLANK_METHOD");
+  if (env_vblank) {
+    ctx->vblank_method = atoi(env_vblank);
+  }
+
   /* Vblank init */
   /* NVIDIA VBlank syncing environment variable defined, signal it and disable
    * any attempt to application side method */
   if (getenv ("__GL_SYNC_TO_VBLANK"))
   {
-    fprintf (stderr, "__GL_SYNC_TO_VBLANK defined in environment\n");
+    if (getenv("STEREO_DEBUG")) fprintf (stderr, "__GL_SYNC_TO_VBLANK defined in environment\n");
     ctx->vblank_method = 2;
     goto out_err;
   }
 
   /* Swap interval */
-  glXSwapIntervalSGI = (PFNGLXSWAPINTERVALSGIPROC)glXGetProcAddress("glXSwapIntervalSGI");
+  glXSwapIntervalSGI = (PFNGLXSWAPINTERVALSGIPROC)glXGetProcAddress((const GLubyte*)"glXSwapIntervalSGI");
+  glXSwapIntervalEXT = (PFNGLXSWAPINTERVALEXTPROC)glXGetProcAddress((const GLubyte*)"glXSwapIntervalEXT");
 
   if (NULL != glXSwapIntervalSGI) {
-    fprintf(stderr, "nvstusb: forcing vsync\n");
-    ctx->vblank_method = 3;
+    if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: forcing vsync\n");
+    if (!getenv("STEREO_PREFER_OML")) ctx->vblank_method = 3;
   }
 
   /* Sync Video */
-  glXGetVideoSyncSGI = (PFNGLXGETVIDEOSYNCSGIPROC)glXGetProcAddress("glXGetVideoSyncSGI");
-  glXWaitVideoSyncSGI = (PFNGLXWAITVIDEOSYNCSGIPROC)glXGetProcAddress("glXWaitVideoSyncSGI");
+  glXGetVideoSyncSGI = (PFNGLXGETVIDEOSYNCSGIPROC)glXGetProcAddress((const GLubyte*)"glXGetVideoSyncSGI");
+  glXWaitVideoSyncSGI = (PFNGLXWAITVIDEOSYNCSGIPROC)glXGetProcAddress((const GLubyte*)"glXWaitVideoSyncSGI");
   if (NULL == glXWaitVideoSyncSGI) {
     glXGetVideoSyncSGI = 0;
   } else {
@@ -289,11 +311,37 @@ nvstusb_init(void)
   }
 
   if (NULL != glXGetVideoSyncSGI ) {
-    fprintf(stderr, "nvstusb: GLX_SGI_video_sync supported!\n");
+    if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: GLX_SGI_video_sync supported!\n");
   }
 
-  fprintf(stderr, "nvstusb:selected vblank method: %d\n", ctx->vblank_method);
-out_err:
+  /* OML sync control */
+  glXGetSyncValuesOML = (PFNGLXGETSYNCVALUESOMLPROC)glXGetProcAddress((const GLubyte*)"glXGetSyncValuesOML");
+  glXWaitForMscOML = (PFNGLXWAITFORMSCOMLPROC)glXGetProcAddress((const GLubyte*)"glXWaitForMscOML");
+  glXWaitForSbcOML = (PFNGLXWAITFORSBCOMLPROC)glXGetProcAddress((const GLubyte*)"glXWaitForSbcOML");
+  glXSwapBuffersMscOML = (PFNGLXSWAPBUFFERSMSCOMLPROC)glXGetProcAddress((const GLubyte*)"glXSwapBuffersMscOML");
+  if (glXGetSyncValuesOML && (glXWaitForMscOML || glXSwapBuffersMscOML)) {
+    if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: GLX_OML_sync_control supported!\n");
+    if (!env_vblank) ctx->vblank_method = 4; /* prefer OML unless overridden */
+  }
+
+  {
+    const char *method_name = "unknown";
+    switch (ctx->vblank_method) {
+      case 0: method_name = "software (front-read)"; break;
+      case 1: method_name = "GLX_SGI_video_sync"; break;
+      case 2: method_name = "__GL_SYNC_TO_VBLANK (driver)"; break;
+      case 3: method_name = "SwapInterval (SGI/EXT)"; break;
+      case 4: method_name = "GLX_OML_sync_control"; break;
+    }
+    fprintf(stderr, "nvstusb: vblank method: %d (%s), OML schedule: %s\n", ctx->vblank_method, method_name, ctx->use_oml_schedule ? "on" : "off");
+  }
+  /* OML schedule gating */
+  ctx->use_oml_schedule = (getenv("STEREO_OML_SCHEDULE") && atoi(getenv("STEREO_OML_SCHEDULE")) != 0) ? 1 : 0;
+  ctx->oml_schedule_ok = 1;
+  ctx->last_msc_seen = 0;
+  ctx->oml_stall_score = 0;
+
+ out_err:
   return ctx;
 }
  
@@ -325,23 +373,34 @@ out_err:
  }
  
  /* set controller refresh rate (should be monitor refresh rate) */
- void
- nvstusb_set_rate(
+  void
+  nvstusb_set_rate(
      struct nvstusb_context *ctx,
      float rate
      ) {
    assert(ctx != 0);
    assert(ctx->device != 0);
-   assert(rate > 60);
+    if (rate < 60.0f) {
+      fprintf(stderr, "nvstusb: refresh rate %.2f Hz too low for stereo; clamping to 60.00 Hz.\n", rate);
+      rate = 60.0f;
+    }
  
    /* send some magic data to device, this function is mainly black magic */
  
    /* some timing voodoo */
-   int32_t frameTime   = (1000000.0/rate);     /* 8.33333 ms if 120 Hz */
-   int32_t activeTime  = 2080;                 /* 2.08000 ms time each eye is on*/
+   int32_t frameTime   = (int32_t)(1000000.0 / (double)rate);     /* 8.33333 ms if 120 Hz */
+    /* Active shutter on-time tuning */
+    int32_t activeTime;
+    const char *env_active = getenv("STEREO_ACTIVE_US");
+    if (env_active && atoi(env_active) > 0) {
+      activeTime = atoi(env_active);
+    } else {
+      /* Default to original 2.08 ms for stability */
+      activeTime  = 2080;
+    }
  
-   int32_t w = NVSTUSB_T2_COUNT(4568.50);      /* 4.56800 ms */
-   int32_t x = NVSTUSB_T0_COUNT(4774.25);      /* 4.77425 ms */
+   int32_t w = NVSTUSB_T2_COUNT((int32_t)4568.50);      /* 4.56800 ms */
+   int32_t x = NVSTUSB_T0_COUNT((int32_t)4774.25);      /* 4.77425 ms */
    int32_t y = NVSTUSB_T0_COUNT(activeTime);
    int32_t z = NVSTUSB_T2_COUNT(frameTime);    
  
@@ -455,7 +514,7 @@ out_err:
    if(ctx->toggled3D) {
      r = r_tmp;
    } else {
-     r = NVSTUSB_T2_COUNT((1e6/ctx->rate)/1.8);
+     r = NVSTUSB_T2_COUNT((int32_t)((1000000.0 / (double)ctx->rate) / 1.8));
    }
  
    if(i%32 == 0) {
@@ -469,7 +528,7 @@ out_err:
      printf("r:%08x %d %lld %lld\n",r, r,NVSTUSB_T0_US(r), NVSTUSB_T2_US(r));
    }
  #else
-   r = NVSTUSB_T2_COUNT((1e6/ctx->rate)/1.8);
+   r = NVSTUSB_T2_COUNT((int32_t)((1000000.0 / (double)ctx->rate) / 1.8));
  #endif
  
    switch(eye) {
@@ -496,8 +555,8 @@ out_err:
  
  
  /* perform swap and toggle eyes hopefully with correct timing */
- void
- nvstusb_swap(
+  void
+  nvstusb_swap(
      struct nvstusb_context *ctx,
      enum nvstusb_eye eye,
      void (*swapfunc)()
@@ -508,7 +567,7 @@ out_err:
  
    /* if we have the GLX_SGI_video_sync extension, we just wait
     * for vertical blanking, then issue swap. */
-   switch(ctx->vblank_method) {
+  switch(ctx->vblank_method) {
    case 0:
      {
        /* Swap buffers */
@@ -525,33 +584,20 @@ out_err:
        nvstusb_set_eye(ctx, eye);
      }
      break;
-   case 1:
-     {
-       unsigned int count;
- 
- 
-       if(eye == nvstusb_quad) {
-         int before_count;
-         /* Waiting OpenGL sync, Do not use current count to */
-         /* prevent eyes from being inverted */
-         glXGetVideoSyncSGI(&count);
-         glXWaitVideoSyncSGI(2, 0, &count);
- 
-       } else {
-         /* Waiting OpenGL sync */
-         glXGetVideoSyncSGI(&count);
-         glXWaitVideoSyncSGI(2, (count+1)%2, &count);
-       }
- 
-       /* Change eye */
-       nvstusb_set_eye(ctx, eye);
- 
-       /* Swap buffers */
-       if(swapfunc) {
-         swapfunc();
-       }
-     }
-     break;
+    case 1:
+      {
+        unsigned int count;
+        glXGetVideoSyncSGI(&count);
+
+        /* Target parity: 0 for left, 1 for right, with inversion support */
+        int target_parity = ((eye == nvstusb_right) ^ ctx->invert_eyes) ? 1 : 0;
+        glXWaitVideoSyncSGI(2, target_parity, &count);
+
+        /* Swap on vblank edge first, then set emitter immediately */
+        if (swapfunc) swapfunc();
+        nvstusb_set_eye(ctx, eye);
+      }
+      break;
    case 2:
      {
        /* case __GL_SYNC_TO_VBLANK is defined */
@@ -568,7 +614,7 @@ out_err:
        nvstusb_set_eye_async(eye);
      }
      break;
-   case 3:
+    case 3:
      {
        static int i_current_interval = -1;
        int i_interval;
@@ -579,22 +625,82 @@ out_err:
        }
  
        /* Swap interval */
-       if(i_current_interval != i_interval) {
-         glXSwapIntervalSGI(i_interval);
-         i_current_interval = i_interval;
-       }
+        if(i_current_interval != i_interval) {
+          Display *dpy = glXGetCurrentDisplay();
+          GLXDrawable draw = glXGetCurrentDrawable();
+          if (glXSwapIntervalEXT && dpy && draw) {
+            glXSwapIntervalEXT(dpy, draw, i_interval);
+          } else if (glXSwapIntervalSGI) {
+            glXSwapIntervalSGI(i_interval);
+          }
+          i_current_interval = i_interval;
+        }
  
-       /* Swap buffers */
-       if(swapfunc) {
-         swapfunc();
-       }
- 
-       /* Change eye */
-       nvstusb_set_eye(ctx, eye);
+        /* For SGI swap interval, prefer matching parity similarly to method 1
+           to reduce phase drift */
+        if (ctx->vblank_method == 3 && glXGetVideoSyncSGI && glXWaitVideoSyncSGI) {
+          unsigned int count;
+          glXGetVideoSyncSGI(&count);
+          int target_parity = ((eye == nvstusb_right) ^ ctx->invert_eyes) ? 1 : 0;
+          glXWaitVideoSyncSGI(2, target_parity, &count);
+        }
+
+        if(swapfunc) swapfunc();
+        nvstusb_set_eye(ctx, eye);
  
      }
      break;
-   default:
+  case 4:
+      {
+        /* OML sync control: prefer scheduled swap to specific parity */
+        Display *dpy = glXGetCurrentDisplay();
+        GLXDrawable draw = glXGetCurrentDrawable();
+        if (dpy && draw && glXGetSyncValuesOML) {
+          int64_t ust, msc, sbc;
+          glXGetSyncValuesOML(dpy, draw, &ust, &msc, &sbc);
+          int target_parity = ((eye == nvstusb_right) ^ ctx->invert_eyes) ? 1 : 0;
+          if (ctx->use_oml_schedule && glXSwapBuffersMscOML) {
+            /* Schedule swap at next MSC with parity = target_parity */
+  int64_t target_divisor = 2LL;
+  int64_t target_remainder = (int64_t)target_parity;
+            int64_t target_msc = 0; /* as soon as possible */
+            int64_t ret_sbc = glXSwapBuffersMscOML(dpy, draw, target_msc, target_divisor, target_remainder);
+            if (ret_sbc >= 0 && glXWaitForSbcOML) {
+              /* Wait for scheduled swap completion */
+              glXWaitForSbcOML(dpy, draw, ret_sbc, &ust, &msc, &sbc);
+              /* Health: MSC should advance; track stalls */
+              if (msc <= ctx->last_msc_seen) {
+                ctx->oml_stall_score++;
+              } else if (ctx->oml_stall_score > 0) {
+                ctx->oml_stall_score--;
+              }
+              ctx->last_msc_seen = msc;
+              if (ctx->oml_stall_score > 6) {
+                /* Too many non-advancing swaps; disable schedule path */
+                ctx->oml_schedule_ok = 0;
+                ctx->use_oml_schedule = 0;
+                fprintf(stderr, "nvstusb: OML schedule disabled due to repeated MSC stalls.\n");
+              }
+            } else {
+              /* Fallback: glFinish() after issuing swap */
+              if (swapfunc) swapfunc();
+            }
+          } else if (glXWaitForMscOML) {
+            /* Fallback: wait for target parity MSC, then swap immediately */
+            glXWaitForMscOML(dpy, draw, 0, 2, target_parity, &ust, &msc, &sbc);
+            if (swapfunc) swapfunc();
+          } else {
+            if (swapfunc) swapfunc();
+          }
+          /* Toggle the emitter immediately after swap aligns to target parity */
+          nvstusb_set_eye(ctx, eye);
+        } else {
+          if (swapfunc) swapfunc();
+          nvstusb_set_eye(ctx, eye);
+        }
+      }
+      break;
+    default:
      fprintf(stderr, "nvstusb: unknown vblank method\n");
    }
  
@@ -771,12 +877,12 @@ out_err:
      i_acc_var += pow((double)(i_new-i_last)-f_mean, 2);
  
      /* std dev */
-     f_var = (double)sqrt(i_acc_var/i_it);
+      f_var = (double)sqrt((double)i_acc_var/(double)i_it);
      i_last = i_new;
  
      /* Display each 512 frame */
-     if(i_it % 512 == 0) {
-       fprintf(stderr,"nvstusb: frame:%d (%0.2f s) mean: %f Hz (%0.2f us) sqrt(var): %0.2f us (%0.1f %%)\n",i_it,f_mean*i_it/1000000.0, 1000000/f_mean, f_mean, f_var, 100.0*f_var/f_mean);
+  if(i_it % 512 == 0) {
+      fprintf(stderr,"nvstusb: frame:%d (%0.2f s) mean: %f Hz (%0.2f us) sqrt(var): %0.2f us (%0.1f %%)\n",i_it,(double)f_mean*(double)i_it/1000000.0, 1000000.0/f_mean, f_mean, f_var, 100.0*f_var/f_mean);
      }
    }
    /* Increment frame counter */
@@ -793,13 +899,60 @@ void nvstusb_set_refresh_rate(struct nvstusb_context *ctx) {
         fprintf(stderr, "StereoHelper: Cannot open display.\n");
         return;
     }
+    /* 1) Env override */
+    const char *env_rate = getenv("STEREO_RATE_HZ");
+    if (env_rate && atof(env_rate) > 0.0) {
+        double frame_rate = atof(env_rate);
+        printf("[stereopreload] Using env STEREO_RATE_HZ=%.2f Hz.\n", frame_rate);
+        nvstusb_set_rate(ctx, frame_rate);
+        XCloseDisplay(display);
+        return;
+    }
+
     int screen = DefaultScreen(display);
+    /* 2) Try XRandR first (optional) */
+    #ifdef USE_XRANDR
+    {
+        Window root = RootWindow(display, screen);
+        XRRScreenResources *res = XRRGetScreenResources(display, root);
+        if (res) {
+            double frame_rate = 0.0;
+            for (int i = 0; i < res->ncrtc && frame_rate == 0.0; ++i) {
+                XRRCrtcInfo *ci = XRRGetCrtcInfo(display, res, res->crtcs[i]);
+                if (ci && ci->mode != None && ci->noutput > 0) {
+                    for (int m = 0; m < res->nmode; ++m) {
+                        if (res->modes[m].id == ci->mode) {
+                            XRRModeInfo *mi = &res->modes[m];
+                            if (mi->hTotal > 0 && mi->vTotal > 0 && mi->dotClock > 0) {
+                                double fr = (double)mi->dotClock / (mi->hTotal * mi->vTotal);
+                                if (fr < 10.0) fr *= 1000.0; // handle kHz dotClock
+                                frame_rate = fr;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (ci) XRRFreeCrtcInfo(ci);
+            }
+            if (frame_rate > 0.0) {
+                printf("[stereopreload] Detected refresh rate via XRandR: %.2f Hz.\n", frame_rate);
+                nvstusb_set_rate(ctx, frame_rate);
+                XRRFreeScreenResources(res);
+                XCloseDisplay(display);
+                return;
+            }
+            XRRFreeScreenResources(res);
+        }
+    }
+    #endif
+
+    /* 3) Fallback to XF86VidMode */
     XF86VidModeModeLine mode_line;
     int pixel_clk = 0;
     if (XF86VidModeGetModeLine(display, screen, &pixel_clk, &mode_line)) {
         if (mode_line.htotal > 0 && mode_line.vtotal > 0) {
             double frame_rate = (double) pixel_clk * 1000.0 / mode_line.htotal / mode_line.vtotal;
-            printf("[stereopreload] Detected refresh rate of %.2f Hz.\n", frame_rate);
+            printf("[stereopreload] Detected refresh rate via XF86VidMode: %.2f Hz.\n", frame_rate);
             nvstusb_set_rate(ctx, frame_rate);
         }
     } else {

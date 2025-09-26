@@ -7,7 +7,7 @@
 #include <libusb-1.0/libusb.h>
 
 static struct libusb_context *nvstusb_usb_context = 0;
-static const int nvstusb_usb_debug_level = 3;
+static const int nvstusb_usb_debug_level = 1;
 
 struct nvstusb_usb_device {
   struct libusb_device_handle *handle;
@@ -52,8 +52,12 @@ nvstusb_usb_init(
     return false;
   }
 
+  #if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000106)
+  libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, nvstusb_usb_debug_level);
+  #else
   libusb_set_debug(ctx, nvstusb_usb_debug_level);
-  fprintf(stderr, "nvstusb: libusb initialized, debug level %d\n", nvstusb_usb_debug_level);
+  #endif
+  if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: libusb initialized, debug level %d\n", nvstusb_usb_debug_level);
 
   nvstusb_usb_context = ctx;
   return true;
@@ -88,7 +92,7 @@ nvstusb_usb_get_numendpoints(
 
   int num = cfgDesc->interface->altsetting->bNumEndpoints;
   libusb_free_config_descriptor(cfgDesc);
-  fprintf(stderr, "nvstusb: Found %d endpoints...\n", num);
+  if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: Found %d endpoints...\n", num);
   return num;
 }
 
@@ -164,10 +168,10 @@ nvstusb_usb_open_device(
   /* Determine which PRODUCTID to use based on call count */
   if (open_count < 2) {
     current_product_id = 0x7003;
-    fprintf(stderr, "nvstusb: Attempt %d with PRODUCTID 0x7003\n", open_count + 1);
+  if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: Attempt %d with PRODUCTID 0x7003\n", open_count + 1);
   } else {
     current_product_id = 0x0007;
-    fprintf(stderr, "nvstusb: Final attempt with PRODUCTID 0x0007\n");
+    if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: Final attempt with PRODUCTID 0x0007\n");
   }
   
   /* If device is already at 0x0007, skip the firmware upload sequence */
@@ -191,7 +195,7 @@ nvstusb_usb_open_device(
     return 0;
   }
 
-  fprintf(stderr, "nvstusb: Found NVIDIA 3d stereo controller with PRODUCTID 0x%04x...\n", current_product_id);
+  if (getenv("STEREO_DEBUG")) fprintf(stderr, "nvstusb: Found NVIDIA 3d stereo controller with PRODUCTID 0x%04x...\n", current_product_id);
 
   struct nvstusb_usb_device *dev = (struct nvstusb_usb_device *) malloc(sizeof(*dev));
   dev->handle = handle;
@@ -208,8 +212,25 @@ nvstusb_usb_open_device(
     libusb_reset_device(dev->handle);
     usleep(250000);
   }
-  libusb_set_configuration(dev->handle, 1); // TODO: error checking
-  libusb_claim_interface(dev->handle, 0);   // TODO: error checking
+  /* Ensure kernel driver is detached and interface 0 is claimed */
+  #if defined(LIBUSB_API_VERSION) && (LIBUSB_API_VERSION >= 0x01000106)
+  libusb_set_auto_detach_kernel_driver(dev->handle, 1);
+  #endif
+  int kact = libusb_kernel_driver_active(dev->handle, 0);
+  if (kact == 1) {
+    int dres = libusb_detach_kernel_driver(dev->handle, 0);
+    if (dres < 0 && dres != LIBUSB_ERROR_NOT_SUPPORTED) {
+      fprintf(stderr, "nvstusb: detach kernel driver failed: %s\n", libusb_error_to_string(dres));
+    }
+  }
+  int sres = libusb_set_configuration(dev->handle, 1);
+  if (sres < 0 && sres != LIBUSB_ERROR_BUSY) {
+    fprintf(stderr, "nvstusb: set_configuration failed: %s\n", libusb_error_to_string(sres));
+  }
+  int cres = libusb_claim_interface(dev->handle, 0);
+  if (cres < 0) {
+    fprintf(stderr, "nvstusb: claim_interface(0) failed: %s\n", libusb_error_to_string(cres));
+  }
 
   open_count++;
   return dev;
@@ -223,6 +244,7 @@ nvstusb_usb_close_device(
   if (0 == dev) return;
 
   if (0 != dev->handle) {
+    libusb_release_interface(dev->handle, 0);
     libusb_close(dev->handle);
   }
   free(dev);
@@ -237,11 +259,33 @@ nvstusb_usb_write_bulk(
   int size
 ) {
   int sent = 0;
+  int res = 0;
+  int attempts = 0;
   
   assert(dev         != 0);
   assert(dev->handle != 0);
 
-  return libusb_bulk_transfer(dev->handle, endpoint | LIBUSB_ENDPOINT_OUT, (unsigned char*)data, size, &sent, 0);
+  do {
+    res = libusb_bulk_transfer(dev->handle, endpoint | LIBUSB_ENDPOINT_OUT,
+                               (unsigned char*)data, size, &sent, 1000);
+    if (res == LIBUSB_ERROR_BUSY) {
+      usleep(1000);
+      attempts++;
+      continue;
+    }
+    if (res == LIBUSB_ERROR_PIPE || res == LIBUSB_ERROR_IO) {
+      libusb_clear_halt(dev->handle, endpoint | LIBUSB_ENDPOINT_OUT);
+      usleep(1000);
+      attempts++;
+      continue;
+    }
+    break;
+  } while (attempts < 5);
+  if (res < 0) {
+    fprintf(stderr, "nvstusb: write_bulk(ep=%d) failed after %d attempts: %s\n",
+            endpoint, attempts+1, libusb_error_to_string(res));
+  }
+  return res < 0 ? res : sent;
 }
 
 /* receive data from an endpoint */
@@ -254,12 +298,32 @@ nvstusb_usb_read_bulk(
 ) {
   int recvd = 0;
   int res;
+  int attempts = 0;
   
   assert(dev         != 0);
   assert(dev->handle != 0);
   
-  res = libusb_bulk_transfer(dev->handle, endpoint | LIBUSB_ENDPOINT_IN, (unsigned char*) data, size, &recvd, 200);
-  return recvd;
+  do {
+    res = libusb_bulk_transfer(dev->handle, endpoint | LIBUSB_ENDPOINT_IN,
+                               (unsigned char*) data, size, &recvd, 500);
+    if (res == LIBUSB_ERROR_BUSY) {
+      usleep(1000);
+      attempts++;
+      continue;
+    }
+    if (res == LIBUSB_ERROR_PIPE || res == LIBUSB_ERROR_IO) {
+      libusb_clear_halt(dev->handle, endpoint | LIBUSB_ENDPOINT_IN);
+      usleep(1000);
+      attempts++;
+      continue;
+    }
+    break;
+  } while (attempts < 5);
+  if (res < 0) {
+    fprintf(stderr, "nvstusb: read_bulk(ep=%d) failed after %d attempts: %s\n",
+            endpoint, attempts+1, libusb_error_to_string(res));
+  }
+  return res < 0 ? res : recvd;
 }
 
  

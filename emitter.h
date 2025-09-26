@@ -11,6 +11,9 @@ void init_emitter();
 extern struct nvstusb_context *nv_ctx;
 extern int emitter_initialized;
 extern bool stereo_thread_started;
-extern int render_count;
+
+// Control the NVST USB background stereo thread
+void emitter_start_usb_thread(void);
+void emitter_stop_usb_thread(void);
 
 #endif // EMITTER_H 
