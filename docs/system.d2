@@ -1,0 +1,122 @@
+# gl-frame-seq-stereo — system overview
+# One shared library, preloaded into an OpenGL app. It never owns the frame;
+# it only edits matrices between the app's calls and toggles USB at swap time.
+# Zones run left to right: entry points -> core -> state -> external.
+# Style classes set strokes only, so light and dark stay readable.
+
+title: |md
+  # gl-frame-seq-stereo
+  An `LD_PRELOAD` GL/GLX interposer that turns a fixed-pipeline OpenGL app into frame-sequential stereo and clicks an NVIDIA 3D Vision IR emitter in step with the swap.
+| {near: top-center}
+
+direction: right
+grid-columns: 2
+grid-rows: 2
+horizontal-gap: 200
+vertical-gap: 180
+
+entry: Entry points {
+  direction: down
+
+  preload: `LD_PRELOAD=./libstereo64.so app` · also `libstereo32.so` for 32-bit titles
+  env: `STEREO_DEBUG`, `STEREO_EYE_OFFSET`, `STEREO_CONVERGENCE`, `STEREO_INJECT_AT_BEGIN`
+  demo: `./demo` · rotating triangle with `--use-lists`, `--extra-identity`, `--extra-clear`
+  osd: OSD hotkeys · `F6` menu, notify strip, FPS overlay, key rebinding
+
+  preload -> env: the constructor reads these before the app draws
+}
+
+state: State {
+  direction: down
+
+  eye: `current_camera` · LEFT or RIGHT, advanced once per presented frame
+  flags: `transformPushedThisFrame`, `projectionPushedThisFrame` · at most one inject per frame
+  proj: `last_projection_type` · frustum, perspective or ortho, from the last setup call
+  osdstate: OSD state · hidden, notify, or menu, plus one edit buffer and binding wait
+  emitterctx: `nvstusb_context` · device handle, current eye, refresh rate, io thread
+}
+
+core: Core {
+  direction: right
+  grid-columns: 3
+  grid-rows: 1
+  horizontal-gap: 110
+
+  interpose: interpose {
+    direction: down
+
+    ctor: `init_stereo_from_env` · constructor parses env before `main`
+    dlsym: `dlsym(RTLD_NEXT)` · every GL/GLX entry point saved once, then wrapped
+    dispatch: `glXGetProcAddress` / `ARB` · app lookups must get the wrapper too
+
+    ctor -> dlsym: config first, real symbols second
+    dlsym -> dispatch: otherwise a direct lookup bypasses the wrapper
+  }
+
+  inject: inject the eye {
+    direction: down
+
+    record: `glFrustum` / `gluPerspective` / `glOrtho` · remember projection kind
+    frame: `glClear` · push eye translate + convergence once per frame
+    reset: `glLoadIdentity` and `glLoadMatrix*` · re-apply after the app resets
+    prim: `glBegin` / `glCallList` · fallback for list-driven apps like glxgears
+
+    record -> frame: projection shape decides the offset maths
+    frame -> reset: apps that reset mid-frame would erase it
+    reset -> prim: last resort for display-list geometry
+  }
+
+  present: present a frame {
+    direction: down
+
+    swap: `glXSwapBuffers` · the only frame boundary the wrapper trusts
+    sync: swap interval + SGI/OML sync · best-effort vblank alignment
+    window: `_NET_WM_BYPASS_COMPOSITOR`, optional fullscreen, move hold
+    toggle: `nvstusb_set_eye` · left/right on the presented frame
+    usb: emitter thread · optional 120 Hz drive, decoupled from swaps
+
+    swap -> sync: the emitter must flip with the vblank, not the call
+    sync -> window: the compositor can present a frame later than the swap
+    window -> toggle: after a drag, resync to LEFT to restore a known phase
+    toggle -> usb: thread mode replaces per-frame toggling
+  }
+
+  device: drive the emitter {
+    direction: down
+
+    open: `nvstusb_init` · libusb open, product `0x7003` then `0x0007`
+    firmware: `nvstusb.fw` · 6 KB blob uploaded to the emitter on open
+    timings: `nvstusb_set_refresh_rate` · timing table written per refresh rate
+    keypoll: drain key events · keeps the device from stalling
+
+    open -> firmware: no emitter without the firmware upload
+    firmware -> timings: timings are only valid after the firmware runs
+    timings -> keypoll: then the device is live and must be drained
+  }
+}
+
+ext: External {
+  direction: down
+
+  x11: X11 server + compositor · windows, keys, attributes, bypass hint
+  glx: GLX driver · the real GL calls and the SGI/OML sync extensions
+  emitter: NVIDIA 3D Vision IR emitter · USB bulk endpoint 2, shutter glasses
+  vblank: monitor refresh · the clock the eye parity must follow
+  app: the OpenGL app · owns its matrices and its own frame loop
+}
+
+entry -> core: preload picks up every GL symbol
+ext -> core: calls and device events arrive, nothing is owned
+core -> state: one eye, one frame, one device context
+
+classes: {
+  entry: {style: {stroke: "#2f6fbf"}}
+  core: {style: {stroke: "#2f8f5f"}}
+  state: {style: {stroke: "#a86a12"; stroke-dash: 3}}
+  ext: {style: {stroke: "#8a4fbf"; stroke-dash: 5}}
+}
+
+entry.class: entry
+core.class: core
+state.class: state
+ext.class: ext

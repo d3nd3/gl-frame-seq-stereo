@@ -2,6 +2,8 @@
 
 This project interposes core OpenGL/GLX calls to produce frame-sequential stereo and drive an NVIDIA 3D Vision IR emitter.
 
+Prefer pictures? Start with **[HUMANS.md](HUMANS.md)**.
+
 See `Drawbacks.md` for known limitations and mitigations.
 Based on earlier libnvstusb code base. credits due.
 ============
